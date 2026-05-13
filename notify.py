@@ -131,20 +131,49 @@ def _tg_alert(watch: dict, slots: list) -> str:
     return msg
 
 
+_MAX_DATES_SHOWN = 5  # max individual dates before collapsing to summary
+
+
 def _tg_range_alert(watch: dict, dates_with_slots: dict) -> str:
     name  = _tg_esc(watch.get("restaurant_name", "?"))
-    url   = _tg_esc(watch.get("restaurant_url", ""))
     party = watch.get("party_size", 2)
     ts    = datetime.now(timezone.utc).strftime("%H:%M UTC")
-
     url_attr = _tg_esc_attr(watch.get("restaurant_url", ""))
-    lines = [f"🍽 <b>{name}</b>  👥 {party}\n"]
-    for date_str, slots in sorted(dates_with_slots.items()):
-        slot_lines = "  ".join(
-            f"🕐 <b>{_tg_esc(s.get('time', '?'))}</b>" for s in slots[:4]
+
+    sorted_dates = sorted(dates_with_slots)
+    total_dates  = len(sorted_dates)
+
+    # Detect repeating pattern: all dates share same slot times
+    def _slot_key(slots):
+        return tuple(sorted(s.get("time", "") for s in slots))
+
+    all_keys = [_slot_key(dates_with_slots[d]) for d in sorted_dates]
+    is_repeating = len(set(all_keys)) == 1 and total_dates > _MAX_DATES_SHOWN
+
+    lines = [f"🍽 <b>{name}</b> — {total_dates} date{'s' if total_dates != 1 else ''} available!  👥 {party}\n"]
+
+    if is_repeating:
+        # Collapsed summary: same slot every day across range
+        sample_slots = dates_with_slots[sorted_dates[0]]
+        slot_times = "  ".join(
+            f"🕐 <b>{_tg_esc(s.get('time', '?'))}</b>"
+            + (f" <i>{_tg_esc(s.get('extra','')[:25])}</i>" if s.get("extra") else "")
+            for s in sample_slots[:3]
         )
-        more = f" +{len(slots)-4} more" if len(slots) > 4 else ""
-        lines.append(f"📅 <b>{_tg_esc(date_str)}</b>  {slot_lines}{more}")
+        lines.append(f"{slot_times}")
+        lines.append(f"📅 {_tg_esc(sorted_dates[0])} → {_tg_esc(sorted_dates[-1])}")
+        lines.append(f"<i>Same availability across all {total_dates} dates</i>")
+    else:
+        # Show up to _MAX_DATES_SHOWN individual dates
+        for date_str in sorted_dates[:_MAX_DATES_SHOWN]:
+            slots = dates_with_slots[date_str]
+            slot_times = "  ".join(
+                f"🕐 <b>{_tg_esc(s.get('time', '?'))}</b>" for s in slots[:3]
+            )
+            more = f" +{len(slots)-3}more" if len(slots) > 3 else ""
+            lines.append(f"📅 <b>{_tg_esc(date_str)}</b>  {slot_times}{more}")
+        if total_dates > _MAX_DATES_SHOWN:
+            lines.append(f"<i>…and {total_dates - _MAX_DATES_SHOWN} more dates</i>")
 
     lines.append(f"\n<i>⚡ Detected at {ts}</i>")
     if url_attr:
@@ -294,13 +323,50 @@ def send_alert(watch: dict, slots: list,
     return tg_ok or wa_ok
 
 
+def _wa_range_alert(watch: dict, dates_with_slots: dict) -> str:
+    """Compact WhatsApp version of range alert."""
+    name  = _wa_esc(watch.get("restaurant_name", "?"))
+    party = watch.get("party_size", 2)
+    url   = watch.get("restaurant_url", "")
+    ts    = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+    sorted_dates = sorted(dates_with_slots)
+    total_dates  = len(sorted_dates)
+
+    def _slot_key(slots):
+        return tuple(sorted(s.get("time", "") for s in slots))
+
+    all_keys = [_slot_key(dates_with_slots[d]) for d in sorted_dates]
+    is_repeating = len(set(all_keys)) == 1 and total_dates > _MAX_DATES_SHOWN
+
+    lines = [f"🍽 *{name}* — {total_dates} date{'s' if total_dates != 1 else ''} open!  👥 {party}\n"]
+
+    if is_repeating:
+        sample_slots = dates_with_slots[sorted_dates[0]]
+        slot_times = "  ".join(s.get("time", "?") for s in sample_slots[:3])
+        lines.append(f"{slot_times}")
+        lines.append(f"📅 {sorted_dates[0]} → {sorted_dates[-1]}")
+        lines.append(f"Same slot across all {total_dates} dates")
+    else:
+        for date_str in sorted_dates[:_MAX_DATES_SHOWN]:
+            slots = dates_with_slots[date_str]
+            slot_times = "  ".join(s.get("time", "?") for s in slots[:3])
+            lines.append(f"📅 {date_str}  {slot_times}")
+        if total_dates > _MAX_DATES_SHOWN:
+            lines.append(f"...and {total_dates - _MAX_DATES_SHOWN} more dates")
+
+    lines.append(f"\n⚡ Detected at {ts}")
+    if url:
+        lines.append(f"Book now → {url}")
+    return "\n".join(lines)
+
+
 def send_range_alert(watch: dict, dates_with_slots: dict,
                      tg_chat_id: str = "", wa_to: Optional[str] = None) -> bool:
     """Send multi-date alert on all configured channels."""
-    slots_flat = [s for sl in dates_with_slots.values() for s in sl]
     tg_ok = _send_telegram(_tg_range_alert(watch, dates_with_slots),
                            tg_chat_id or watch.get("chat_id", ""))
-    wa_ok = _send_whatsapp(_wa_alert(watch, slots_flat), wa_to)
+    wa_ok = _send_whatsapp(_wa_range_alert(watch, dates_with_slots), wa_to)
     return tg_ok or wa_ok
 
 

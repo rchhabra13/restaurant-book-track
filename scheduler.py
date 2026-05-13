@@ -503,6 +503,16 @@ def check_single_watch(watch: dict) -> dict:
 
     _resolve_venue_id(watch)
 
+    # Skip single-date watches whose target has already passed
+    if watch.get("date_mode", "single") == "single":
+        try:
+            if _date.fromisoformat(watch["target_date"]) < _date.today():
+                logger.debug("Skipping past-date watch %s (%s)", watch.get("id"), watch["target_date"])
+                deactivate_watch(watch.get("id", ""))
+                return {"success": True, "slots": [], "html_hash": ""}
+        except (ValueError, KeyError):
+            pass
+
     if watch.get("date_mode", "single") != "single":
         out = _check_watch_date_range(watch)
         metrics.log("check_done",
