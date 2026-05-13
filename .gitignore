@@ -1,0 +1,30 @@
+# Secrets — never commit
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Playwright
+playwright-report/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Logs / temp
+*.log
+/tmp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Screenshots from booker (contain PII)
+*.png
+*.jpg
