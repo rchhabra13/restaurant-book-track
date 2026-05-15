@@ -45,6 +45,12 @@ CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "15"))
 # ── Alerts ────────────────────────────────────────────────────────────
 ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "60"))
 
+# Quiet hours: don't send alerts between these hours (24h local time).
+# Set both to same value to disable. Example: 23 → 7 silences 11pm-7am.
+QUIET_HOURS_START = int(os.getenv("QUIET_HOURS_START", "0"))
+QUIET_HOURS_END   = int(os.getenv("QUIET_HOURS_END",   "0"))
+QUIET_HOURS_TZ    = os.getenv("QUIET_HOURS_TZ", "America/New_York")
+
 # ── Auto-Booking ──────────────────────────────────────────────────────
 AUTO_BOOK_ENABLED = os.getenv("AUTO_BOOK_ENABLED", "false").lower() == "true"
 
@@ -65,5 +71,17 @@ BURST_WINDOW_MINUTES         = int(os.getenv("BURST_WINDOW_MINUTES", "15"))
 RELEASE_LEARN_ENABLED        = os.getenv("RELEASE_LEARN_ENABLED", "true").lower() == "true"
 
 # ── Platform API keys ─────────────────────────────────────────────────
-# Resy's public web API key (visible in browser devtools; not a secret)
-RESY_API_KEY = os.getenv("RESY_API_KEY", "VbWk7s3L4KiK5fzlO7JD3Q5EYolEVsC")
+# Resy's web API key. Lifted from devtools on resy.com — public/non-secret per se
+# but bots that share one key get fingerprinted, so set your own in .env to be safe.
+RESY_API_KEY = os.getenv("RESY_API_KEY", "")
+if not RESY_API_KEY:
+    logger.warning("RESY_API_KEY not set in .env — Resy API path disabled. "
+                   "Grab the value from resy.com devtools (Network tab, Authorization: ResyAPI api_key=...).")
+
+# Manual Resy auth_token — extract from logged-in browser cookies (resy_token).
+# Use this to skip the auto-login flow (which gets 419-rate-limited heavily).
+RESY_AUTH_TOKEN = os.getenv("RESY_AUTH_TOKEN", "")
+
+# Optional outbound proxy — useful when an IP gets banned by Resy.
+# Example: HTTPS_PROXY=http://user:pass@host:port
+HTTPS_PROXY = os.getenv("HTTPS_PROXY", "") or os.getenv("HTTP_PROXY", "")

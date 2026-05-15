@@ -238,7 +238,51 @@ BURST_CHECK_INTERVAL_SECONDS=10
 BURST_WINDOW_MINUTES=60
 REQUEST_DELAY_SECONDS=2
 ALERT_COOLDOWN_MINUTES=30
+
+# ── Quiet hours (no alerts between these hours, local TZ) ─────────────
+QUIET_HOURS_START=0
+QUIET_HOURS_END=0
+QUIET_HOURS_TZ=America/New_York
+
+# ── Resy power-user options ───────────────────────────────────────────
+# Manual auth token — grab the resy_token cookie from your logged-in browser
+# to skip the auto-login flow (avoids HTTP 419 rate limits entirely).
+RESY_AUTH_TOKEN=
+# Outbound proxy — useful when an IP gets banned by Resy
+# HTTPS_PROXY=http://user:pass@host:port
+
+# ── Observability ─────────────────────────────────────────────────────
+SENTRY_DSN=
+HEALTHZ_PORT=8090
 ```
+
+### Conversational bot
+
+You don't need slash commands. Talk to the bot in plain English:
+
+```
+add bungalow              → starts tracking
+watch carbone any 4       → alert on any date, party 4
+track ishq on 2026-06-15  → alert on a specific date
+check tatiana             → one-off availability check
+stop watching odo         → delete the watch
+remove semma              → remove restaurant entirely
+pause carbone             → temporarily mute
+list / status / help      → bare-word commands
+```
+
+Slash commands still work for power users — `/help` shows the full grammar.
+
+### Health monitoring
+
+A tiny `/healthz` endpoint is exposed (default port 8090) for uptime monitors:
+
+```bash
+curl http://127.0.0.1:8090/healthz
+{"ok":true,"uptime_s":293.5,"last_tick_age_s":3.6,"mongo_ok":true,"active_watches":6}
+```
+
+HTTP `200` = healthy, `503` = scheduler stuck or Mongo unreachable.
 
 ---
 

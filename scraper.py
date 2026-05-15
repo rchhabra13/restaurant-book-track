@@ -95,44 +95,168 @@ def fetch_page(url: str, use_browser: bool = False) -> Optional[str]:
     return _fetch_with_requests(url)
 
 
+_http_session = requests.Session()
+
+
 def _fetch_with_requests(url: str) -> Optional[str]:
     headers = {"User-Agent": USER_AGENT}
-    for attempt in range(1, MAX_RETRIES + 1):
+    try:
+        # Single attempt; let scheduler tick retry instead of blocking thread.
+        resp = _http_session.get(url, headers=headers,
+                                 timeout=(5, REQUEST_TIMEOUT))  # (connect, read)
+        resp.raise_for_status()
+        return resp.text
+    except requests.RequestException as exc:
+        logger.warning("HTTP fetch failed for %s: %s", url, exc)
+        return None
+
+
+PLAYWRIGHT_NAV_TIMEOUT_MS  = 15_000  # max nav time per page
+PLAYWRIGHT_RENDER_WAIT_MS  = 1_500   # short wait for SPA slot render
+PLAYWRIGHT_TOTAL_BUDGET_S  = 20      # hard wall-clock budget for one fetch
+SCRAPER_HTML_CACHE_TTL_S   = 8       # share fetched HTML across watches for ~one tick
+
+# ── Persistent Playwright singleton ───────────────────────────────────
+#
+# Launching Chromium costs ~800ms per call. With 7 watches × 5 dates =
+# 35 fetches per tick that's 28 seconds just spinning up the browser.
+# Keep one browser process alive and reuse it; close pages individually.
+
+import threading as _threading
+
+# Playwright's sync API is bound to the greenlet/thread that started it, so
+# share-across-threads is impossible. Use thread-local browsers: each worker
+# thread keeps its own Chromium instance, reused across fetches in that thread.
+
+_pw_tls = _threading.local()
+_pw_known_locals: list = []
+_pw_known_lock = _threading.Lock()
+
+
+def _get_browser():
+    """Return this thread's Playwright browser, creating one if needed."""
+    browser = getattr(_pw_tls, "browser", None)
+    if browser is not None:
         try:
-            resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            return resp.text
-        except requests.RequestException as exc:
-            logger.warning("Attempt %d failed for %s: %s", attempt, url, exc)
-            if attempt < MAX_RETRIES:
-                time.sleep(REQUEST_DELAY_SECONDS)
-    return None
+            _ = browser.contexts  # liveness probe
+            return browser
+        except Exception:
+            logger.info("Playwright browser dead in %s — relaunching",
+                        _threading.current_thread().name)
+            try:
+                instance = getattr(_pw_tls, "instance", None)
+                if instance is not None:
+                    instance.stop()
+            except Exception:
+                pass
+            _pw_tls.browser = None
+            _pw_tls.instance = None
 
-
-def _fetch_with_playwright(url: str) -> Optional[str]:
-    """Fetch JS-rendered page using Playwright."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        logger.warning("Playwright not installed. Run: pip install playwright && playwright install chromium")
+        logger.warning("Playwright not installed.")
         return None
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    instance = sync_playwright().start()
+    browser  = instance.chromium.launch(headless=True)
+    _pw_tls.instance = instance
+    _pw_tls.browser  = browser
+    with _pw_known_lock:
+        _pw_known_locals.append(_pw_tls)
+    logger.info("Playwright: launched Chromium for thread %s",
+                _threading.current_thread().name)
+    return browser
+
+
+def shutdown_browser() -> None:
+    """Shut down all thread-local Playwright instances. Best-effort."""
+    with _pw_known_lock:
+        snapshot = list(_pw_known_locals)
+        _pw_known_locals.clear()
+    for tls in snapshot:
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page()
-                page.set_extra_http_headers({"User-Agent": USER_AGENT})
-                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-                page.wait_for_timeout(3000)  # extra wait for Resy slots to render
-                html = page.content()
-                browser.close()
-                return html
-        except Exception as exc:
-            logger.warning("Playwright attempt %d failed for %s: %s", attempt, url, exc)
-            if attempt < MAX_RETRIES:
-                time.sleep(REQUEST_DELAY_SECONDS)
-    return None
+            b = getattr(tls, "browser", None)
+            if b is not None:
+                b.close()
+        except Exception:
+            pass
+        try:
+            inst = getattr(tls, "instance", None)
+            if inst is not None:
+                inst.stop()
+        except Exception:
+            pass
+
+
+def _fetch_with_playwright(url: str) -> Optional[str]:
+    """
+    Fetch a JS-rendered page using this thread's persistent Playwright browser.
+
+    A fresh BrowserContext is created per fetch so cookies/state don't leak
+    across requests. No retries — scheduler will revisit on next tick.
+    """
+    browser = _get_browser()
+    if browser is None:
+        return None
+
+    deadline = time.monotonic() + PLAYWRIGHT_TOTAL_BUDGET_S
+    context = None
+    try:
+        context = browser.new_context(user_agent=USER_AGENT)
+        page = context.new_page()
+        page.set_default_navigation_timeout(PLAYWRIGHT_NAV_TIMEOUT_MS)
+        page.set_default_timeout(PLAYWRIGHT_NAV_TIMEOUT_MS)
+        page.goto(url, wait_until="domcontentloaded",
+                  timeout=PLAYWRIGHT_NAV_TIMEOUT_MS)
+        remaining_ms = max(200, int((deadline - time.monotonic()) * 1000))
+        page.wait_for_timeout(min(PLAYWRIGHT_RENDER_WAIT_MS, remaining_ms))
+        return page.content()
+    except Exception as exc:
+        logger.warning("Playwright failed for %s: %s", url, exc)
+        # Mark this thread's browser as dead — get re-created on next call
+        try:
+            _pw_tls.browser = None
+        except Exception:
+            pass
+        return None
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+
+# ── HTML response cache (per-URL, short TTL) ─────────────────────────
+#
+# Multiple watches on the same restaurant URL share one fetch within a tick.
+# Cache stores the parsed result, not raw HTML, so callers always get
+# `dict` shape (slots, html_hash, success).
+
+_html_cache: dict[str, tuple[float, dict]] = {}
+_html_cache_lock = _threading.Lock()
+
+
+def _cache_get(key: str) -> Optional[dict]:
+    with _html_cache_lock:
+        entry = _html_cache.get(key)
+        if entry is None:
+            return None
+        ts, value = entry
+        if time.time() - ts > SCRAPER_HTML_CACHE_TTL_S:
+            del _html_cache[key]
+            return None
+        return value
+
+
+def _cache_put(key: str, value: dict) -> None:
+    with _html_cache_lock:
+        _html_cache[key] = (time.time(), value)
+        # Bounded size
+        if len(_html_cache) > 500:
+            oldest = min(_html_cache.items(), key=lambda kv: kv[1][0])[0]
+            del _html_cache[oldest]
 
 
 def html_hash(html: str) -> str:
@@ -329,16 +453,25 @@ def check_availability(
     if platform == "auto":
         platform = detect_platform(url)
 
+    # Cache key includes target_date + party so different views aren't conflated.
+    cache_key = f"{url}|{target_date}|{party_size}|{platform}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        logger.debug("scraper cache hit for %s", cache_key)
+        return cached
+
     # Resy is JS-rendered; use Playwright to get slot data
     use_browser = platform == "resy"
     html = fetch_page(url, use_browser=use_browser)
     if html is None:
-        return {
+        result = {
             "success": False,
             "slots": [],
             "message": "Failed to fetch page (blocked by robots.txt or network error).",
             "html_hash": "",
         }
+        # Don't cache failures — let next tick retry
+        return result
 
     parser = SCRAPERS.get(platform, _parse_generic)
     try:
@@ -347,9 +480,11 @@ def check_availability(
         logger.exception("Parser error for %s: %s", url, exc)
         raw_slots = []
 
-    return {
+    result = {
         "success": True,
         "slots": [s.to_dict() for s in raw_slots],
         "message": f"Found {len(raw_slots)} slot(s) via '{platform}' parser.",
         "html_hash": html_hash(html),
     }
+    _cache_put(cache_key, result)
+    return result

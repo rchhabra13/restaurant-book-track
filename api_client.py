@@ -86,10 +86,13 @@ class ResyClient:
     The user token is obtained by logging in with email + password.
     """
 
-    def __init__(self, email: str = "", password: str = ""):
+    def __init__(self, email: str = "", password: str = "",
+                 auth_token: str = ""):
         self.email    = email
         self.password = password
-        self.token: Optional[str] = None
+        # Prefer a manually-supplied token (extracted from logged-in browser).
+        # Bypasses the auto-login flow that is heavily 419-rate-limited by Resy.
+        self.token: Optional[str] = auth_token or None
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -106,7 +109,16 @@ class ResyClient:
             ),
         })
 
-        if email and password:
+        # Apply outbound proxy if configured (per-request override; respects HTTPS_PROXY env)
+        from config import HTTPS_PROXY
+        if HTTPS_PROXY:
+            self.session.proxies = {"http": HTTPS_PROXY, "https": HTTPS_PROXY}
+            logger.info("Resy client using proxy %s", HTTPS_PROXY)
+
+        if self.token:
+            self.session.headers["X-Resy-Auth-Token"] = self.token
+            logger.info("Resy: using manual auth token (%d chars) — skipping login", len(self.token))
+        elif email and password:
             self._login()
 
     # ── Auth ──────────────────────────────────────────────────────────
@@ -521,18 +533,20 @@ def _parse_ot_time(time_str: str) -> str:
 # Factory
 # ══════════════════════════════════════════════════════════════════════
 
-def get_client(platform: str, email: str = "", password: str = ""):
+def get_client(platform: str, email: str = "", password: str = "",
+               auth_token: str = ""):
     """
     Return the appropriate API client for *platform*.
 
     Parameters
     ----------
-    platform : "resy" | "opentable"
-    email    : account email (required for booking; optional for slot checks)
-    password : account password
+    platform   : "resy" | "opentable"
+    email      : account email (required for booking; optional for slot checks)
+    password   : account password
+    auth_token : manually-supplied auth token (Resy only) — bypasses login flow.
     """
     if platform == "resy":
-        return ResyClient(email=email, password=password)
+        return ResyClient(email=email, password=password, auth_token=auth_token)
     elif platform == "opentable":
         return OpenTableClient(email=email, password=password)
     else:

@@ -49,7 +49,32 @@ import requests as _requests
 from config import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
+    QUIET_HOURS_START,
+    QUIET_HOURS_END,
+    QUIET_HOURS_TZ,
 )
+
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+except ImportError:
+    ZoneInfo = None
+
+
+def _in_quiet_hours() -> bool:
+    """Return True if current local time falls inside QUIET_HOURS_START–END."""
+    if QUIET_HOURS_START == QUIET_HOURS_END:
+        return False
+    if ZoneInfo is None:
+        now_h = datetime.now().hour
+    else:
+        try:
+            now_h = datetime.now(ZoneInfo(QUIET_HOURS_TZ)).hour
+        except Exception:
+            now_h = datetime.now().hour
+    start, end = QUIET_HOURS_START, QUIET_HOURS_END
+    if start < end:
+        return start <= now_h < end
+    return now_h >= start or now_h < end  # wraps midnight
 
 logger = logging.getLogger(__name__)
 
@@ -316,8 +341,16 @@ def _send_whatsapp(text: str, to: Optional[str] = None) -> bool:
 # ══════════════════════════════════════════════════════════════════════
 
 def send_alert(watch: dict, slots: list,
-               tg_chat_id: str = "", wa_to: Optional[str] = None) -> bool:
-    """Send slot-available alert on all configured channels."""
+               tg_chat_id: str = "", wa_to: Optional[str] = None,
+               force: bool = False) -> bool:
+    """
+    Send slot-available alert on all configured channels.
+    Respects quiet hours unless force=True.
+    """
+    if not force and _in_quiet_hours():
+        logger.info("Quiet hours: suppressing alert for %s",
+                    watch.get("restaurant_name"))
+        return False
     tg_ok = _send_telegram(_tg_alert(watch, slots), tg_chat_id or watch.get("chat_id", ""))
     wa_ok = _send_whatsapp(_wa_alert(watch, slots), wa_to)
     return tg_ok or wa_ok
@@ -362,8 +395,13 @@ def _wa_range_alert(watch: dict, dates_with_slots: dict) -> str:
 
 
 def send_range_alert(watch: dict, dates_with_slots: dict,
-                     tg_chat_id: str = "", wa_to: Optional[str] = None) -> bool:
+                     tg_chat_id: str = "", wa_to: Optional[str] = None,
+                     force: bool = False) -> bool:
     """Send multi-date alert on all configured channels."""
+    if not force and _in_quiet_hours():
+        logger.info("Quiet hours: suppressing range alert for %s",
+                    watch.get("restaurant_name"))
+        return False
     tg_ok = _send_telegram(_tg_range_alert(watch, dates_with_slots),
                            tg_chat_id or watch.get("chat_id", ""))
     wa_ok = _send_whatsapp(_wa_range_alert(watch, dates_with_slots), wa_to)

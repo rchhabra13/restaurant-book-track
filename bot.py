@@ -153,39 +153,50 @@ def _format_slots(slots: list, max_show: int = 8) -> str:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "🍽 <b>TableWatch</b> — Restaurant Booking Tracker\n\n"
-        "I monitor restaurant reservation pages and alert you when slots open up.\n\n"
-        "<b>Quick start:</b>\n"
-        "1️⃣  <code>/add https://resy.com/cities/ny/semma Semma</code>\n"
-        "2️⃣  <code>/watch Semma any 2</code>  or  <code>/watch Semma 2026-05-15 2</code>\n"
-        "3️⃣  I'll check every {interval} min and message you when slots appear.\n\n"
-        "Type /help for full command list."
-    ).format(interval=CHECK_INTERVAL_MINUTES)
+        "🍽 <b>TableWatch</b>\n"
+        "I watch Resy &amp; OpenTable for open reservations and ping you the moment a slot drops.\n\n"
+        "<b>Talk to me however you like</b> — I understand:\n"
+        "  • <i>add bungalow</i> · <i>track carbone any 4</i>\n"
+        "  • <i>check ishq</i> · <i>list</i> · <i>status</i>\n"
+        "  • <i>stop watching odo</i> · <i>pause tatiana</i>\n\n"
+        "<b>Or use slash commands</b> — type /help for the full list.\n\n"
+        "<b>Step 1 — add a restaurant</b>\n"
+        "<code>/add https://resy.com/cities/ny/semma Semma</code>\n"
+        "(or paste any booking URL)\n\n"
+        "<b>Step 2 — set a watch</b>\n"
+        "<i>watch semma any 2</i>   ← any day next 30d\n"
+        "<i>watch semma 2026-06-15 2</i>   ← specific date\n\n"
+        "I'll alert you as soon as a slot opens."
+    )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "📖 <b>Command Reference</b>\n\n"
-        "<b>Restaurants</b>\n"
-        "/add <code>&lt;url&gt;</code> <code>[name]</code> — Add a restaurant\n"
-        "/list — Show all your restaurants\n"
-        "/remove <code>&lt;name|#N&gt;</code> — Remove a restaurant\n"
-        "/pause <code>&lt;name|#N&gt;</code> — Pause monitoring\n"
-        "/resume <code>&lt;name|#N&gt;</code> — Resume monitoring\n\n"
-        "<b>Watches</b>\n"
+        "📖 <b>How to talk to me</b>\n\n"
+        "<b>Natural phrases (recommended)</b>\n"
+        "  • <i>add bungalow</i> — start tracking\n"
+        "  • <i>watch carbone any 4</i> — alert on any date, party 4\n"
+        "  • <i>track ishq on 2026-06-15 for 2</i>\n"
+        "  • <i>check tatiana</i> — one-off availability check\n"
+        "  • <i>stop watching odo</i> — delete a watch\n"
+        "  • <i>remove semma</i> — remove restaurant + all its watches\n"
+        "  • <i>pause carbone</i> / <i>resume carbone</i>\n"
+        "  • <i>list</i> · <i>watches</i> · <i>status</i>\n\n"
+        "<b>Slash-command reference</b>\n"
+        "/add <code>&lt;url&gt;</code> <code>[name]</code> — add a restaurant\n"
+        "/list — your restaurants\n"
+        "/remove <code>&lt;name|#N&gt;</code> — drop one\n"
+        "/pause · /resume <code>&lt;name|#N&gt;</code>\n"
         "/watch <code>&lt;name&gt; &lt;date_spec&gt; [party] [time_pref]</code>\n"
-        "  date_spec: <code>YYYY-MM-DD</code> · <code>any</code> · <code>DATE:DATE</code> · <code>DATE to DATE</code>\n"
+        "  date_spec: <code>YYYY-MM-DD</code> · <code>any</code> · <code>DATE:DATE</code>\n"
         "  time_pref: any, lunch, dinner, late\n"
-        "/watches — List all your watches\n"
-        "/unwatch <code>&lt;#N&gt;</code> — Delete a watch\n\n"
-        "<b>Checking</b>\n"
-        "/check <code>&lt;name|#N&gt;</code> — Check a restaurant now\n"
-        "/checkall — Check all active watches\n\n"
-        "<b>Info</b>\n"
-        "/status — Dashboard overview\n"
-        "/help — This message\n\n"
-        "<i>Tip: Use #N (e.g. #1, #2) to reference items by their list number.</i>"
+        "/watches — your watches\n"
+        "/unwatch <code>&lt;#N&gt;</code>\n"
+        "/check <code>&lt;name|#N&gt;</code> · /checkall\n"
+        "/status — dashboard\n"
+        "/setrelease · /learnrelease — release schedule\n\n"
+        "<i>Tip: reference items by #N (e.g. #1) from /list or /watches.</i>"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -980,16 +991,30 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Catch-all for unrecognized messages ───────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle plain text messages — try to detect URLs."""
+    """
+    Handle plain text. Try the natural-language parser first; fall back to URL
+    detection and finally to a help-prompt.
+    """
     text = update.message.text.strip()
+    from nl_parser import (
+        parse, INTENT_ADD, INTENT_WATCH, INTENT_CHECK, INTENT_REMOVE,
+        INTENT_UNWATCH, INTENT_LIST, INTENT_WATCHES, INTENT_STATUS,
+        INTENT_HELP, INTENT_PAUSE, INTENT_RESUME, INTENT_UNKNOWN,
+    )
 
-    # If the message contains a URL, offer to add it
+    intent = parse(text)
+    if intent.kind != INTENT_UNKNOWN and intent.confidence >= 0.5:
+        await _dispatch_intent(update, context, intent)
+        return
+
+    # Legacy URL-only fallback
     url_match = re.search(r"https?://[^\s.,;!?)'\"]+", text)
     if url_match:
         url = url_match.group(0)
         platform = detect_platform(url)
         await update.message.reply_text(
-            f"I see a link! Want to track this restaurant?\n\n"
+            f"📎 Got a link. Want me to track this?\n\n"
+            f"Reply <code>add</code> to confirm — or use:\n"
             f"<code>/add {esc(url)}</code>\n\n"
             f"Detected platform: <b>{esc(platform)}</b>",
             parse_mode=ParseMode.HTML,
@@ -997,9 +1022,96 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "I didn't understand that. Type /help for available commands.",
+        "🤔 I didn't catch that. Try things like:\n"
+        "  • <i>add bungalow</i>\n"
+        "  • <i>watch carbone any 4</i>\n"
+        "  • <i>check ishq</i>\n"
+        "  • <i>list</i> · <i>status</i> · <i>help</i>",
         parse_mode=ParseMode.HTML,
     )
+
+
+async def _dispatch_intent(update, context, intent):
+    """Route a parsed NL Intent to the corresponding slash-command handler."""
+    from nl_parser import (
+        INTENT_ADD, INTENT_WATCH, INTENT_CHECK, INTENT_REMOVE, INTENT_UNWATCH,
+        INTENT_LIST, INTENT_WATCHES, INTENT_STATUS, INTENT_HELP,
+        INTENT_PAUSE, INTENT_RESUME,
+    )
+
+    # Build a fake context.args list and reuse existing handlers
+    class _A: pass
+
+    async def _run(handler, args):
+        ctx = _A()
+        ctx.args = args
+        await handler(update, ctx)
+
+    if intent.kind == INTENT_LIST:    return await _run(cmd_list,    [])
+    if intent.kind == INTENT_WATCHES: return await _run(cmd_watches, [])
+    if intent.kind == INTENT_STATUS:  return await _run(cmd_status,  [])
+    if intent.kind == INTENT_HELP:    return await _run(cmd_help,    [])
+
+    if intent.kind == INTENT_PAUSE:   return await _run(cmd_pause,   intent.name.split())
+    if intent.kind == INTENT_RESUME:  return await _run(cmd_resume,  intent.name.split())
+    if intent.kind == INTENT_CHECK:   return await _run(cmd_check,   intent.name.split())
+    if intent.kind == INTENT_REMOVE:  return await _run(cmd_remove,  intent.name.split())
+
+    if intent.kind == INTENT_UNWATCH:
+        # /unwatch needs #N — look up first watch by name
+        chat_id = _chat_id(update)
+        watches = get_watches(active_only=False, chat_id=chat_id)
+        match = next((w for w in watches
+                      if intent.name.lower() in w["restaurant_name"].lower()), None)
+        if not match:
+            await update.message.reply_text(
+                f"❌ No watch found matching <b>{esc(intent.name)}</b>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        delete_watch(match["id"])
+        await update.message.reply_text(
+            f"🗑 Stopped watching <b>{esc(match['restaurant_name'])}</b> on {esc(match['target_date'])}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if intent.kind == INTENT_ADD:
+        if intent.url:
+            return await _run(cmd_add, [intent.url])
+        # No URL — name only. Check if restaurant already exists; if so, suggest /watch.
+        chat_id = _chat_id(update)
+        existing = _resolve_restaurant(intent.name, chat_id)
+        if existing:
+            await update.message.reply_text(
+                f"✅ <b>{esc(existing['name'])}</b> is already tracked.\n\n"
+                f"Create a watch with:\n"
+                f"<code>/watch {esc(existing['name'])} any {intent.party_size}</code>\n"
+                f"or just say <i>watch {esc(existing['name'])} any</i>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        await update.message.reply_text(
+            f"🔗 I need a booking URL to add <b>{esc(intent.name)}</b>.\n\n"
+            f"Send something like:\n"
+            f"<code>/add https://resy.com/cities/ny/{intent.name.lower().replace(' ', '-')} {esc(intent.name)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if intent.kind == INTENT_WATCH:
+        chat_id = _chat_id(update)
+        r = _resolve_restaurant(intent.name, chat_id)
+        if not r:
+            await update.message.reply_text(
+                f"❌ I don't have <b>{esc(intent.name)}</b> in your list yet.\n"
+                f"Add it first: <code>/add &lt;url&gt; {esc(intent.name)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        date_arg = intent.date or "any"
+        args = [r["name"], date_arg, str(intent.party_size)]
+        return await _run(cmd_watch, args)
 
 
 # ═══════════════════════════════════════════════════════════════════════

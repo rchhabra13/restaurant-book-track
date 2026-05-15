@@ -44,6 +44,7 @@ from config import (
     BURST_WINDOW_MINUTES,
     RESY_EMAIL,
     RESY_PASSWORD,
+    RESY_AUTH_TOKEN,
     OPENTABLE_EMAIL,
     OPENTABLE_PASSWORD,
 )
@@ -53,6 +54,9 @@ from database import (
     get_latest_availability,
     was_recently_alerted,
     log_alert,
+    log_alert_with_signature,
+    get_previous_slot_signature,
+    _slot_signature,
     was_recently_booked,
     log_booking,
     deactivate_watch,
@@ -92,10 +96,12 @@ OPENTABLE_LOGIN_COOLDOWN_SECONDS = 60
 
 def _get_resy_client():
     """
-    Return a logged-in ResyClient.
+    Return a Resy client.
 
-    Login is attempted at most once per RESY_LOGIN_COOLDOWN_SECONDS to avoid
-    Resy's HTTP 419 rate-limiting when many watches fire in the same cycle.
+    Priority order:
+      1. Manual RESY_AUTH_TOKEN from .env — skips login entirely (recommended).
+      2. Email/password login, throttled at most once per RESY_LOGIN_COOLDOWN_SECONDS
+         to avoid HTTP 419 rate-limiting.
     """
     global _resy_client, _resy_login_last_attempt
 
@@ -103,15 +109,34 @@ def _get_resy_client():
     if _resy_client is not None and _resy_client.token:
         return _resy_client
 
+    # Prefer manual token if provided — no login round trip, no 419 risk
+    if RESY_AUTH_TOKEN:
+        from api_client import get_client
+        _resy_client = get_client("resy", auth_token=RESY_AUTH_TOKEN)
+        if _resy_client and _resy_client.token:
+            logger.info("Resy: using manual auth token from .env")
+            return _resy_client
+
+    # Try the persisted token from a previous successful login
+    try:
+        from database import load_platform_token
+        stored = load_platform_token("resy")
+        if stored:
+            from api_client import get_client
+            _resy_client = get_client("resy", auth_token=stored)
+            if _resy_client and _resy_client.token:
+                logger.info("Resy: using stored auth token from DB")
+                return _resy_client
+    except Exception as exc:
+        logger.debug("load_platform_token failed: %s", exc)
+
     if not (RESY_EMAIL and RESY_PASSWORD):
         return None
 
     now = _time.time()
     if now - _resy_login_last_attempt < RESY_LOGIN_COOLDOWN_SECONDS:
-        # Still in cooldown — don't hammer Resy with login attempts
         return None
 
-    # Attempt login (record time regardless of outcome so failures are throttled too)
     _resy_login_last_attempt = now
     logger.info("Attempting Resy login…")
     import metrics
@@ -122,6 +147,12 @@ def _get_resy_client():
         _resy_client = client
         logger.info("Resy login succeeded.")
         metrics.log("login_success", platform="resy")
+        # Persist for next restart
+        try:
+            from database import save_platform_token
+            save_platform_token("resy", client.token)
+        except Exception as exc:
+            logger.debug("save_platform_token failed: %s", exc)
         return _resy_client
 
     logger.warning(
@@ -266,16 +297,23 @@ def _format_burst_alert(watch: dict, minutes_away: float) -> str:
 # Slot-checking pipeline
 # ══════════════════════════════════════════════════════════════════════
 
-def _get_slots_via_api(watch: dict) -> list:
+def _get_slots_via_api(watch: dict) -> tuple[list, bool]:
     """
     Use the direct platform API (fast, no Playwright).
-    Falls back to scraper if API returns nothing.
+
+    Returns
+    -------
+    (slots, api_ok) :
+        slots  : list of slot dicts (may be empty if venue has no availability)
+        api_ok : True if the API call completed successfully (even with 0 slots).
+                 Callers should NOT fall back to scraper when api_ok=True —
+                 an empty list from the official API is authoritative.
     """
     platform  = watch.get("restaurant_platform", "generic")
     venue_id  = watch.get("restaurant_venue_id")
 
     if platform not in ("resy", "opentable") or not venue_id:
-        return []
+        return [], False
 
     try:
         if platform == "resy":
@@ -284,14 +322,14 @@ def _get_slots_via_api(watch: dict) -> list:
             client = _get_opentable_client()
 
         if not client:
-            return []
+            return [], False
 
         api_slots = client.get_slots(venue_id, watch["target_date"], watch["party_size"])
-        return [s.to_dict() for s in api_slots]
+        return [s.to_dict() for s in api_slots], True
 
     except Exception as exc:
         logger.warning("API slot fetch failed for watch %s: %s", watch.get("id"), exc)
-        return []
+        return [], False
 
 
 def _resolve_venue_id(watch: dict) -> None:
@@ -345,10 +383,14 @@ def _fetch_slots_for_date(watch: dict, target_date: str) -> dict:
     def _do_fetch() -> dict:
         import rate_limiter
         rate_limiter.acquire(platform)
-        slots = _get_slots_via_api(w)
+        slots, api_ok = _get_slots_via_api(w)
         html_hash = ""
         success = True
-        if not slots:
+
+        # Only fall back to the Playwright scraper if the API path itself
+        # failed (no token, network error, etc). An empty list from the
+        # official API is authoritative — don't waste a browser load.
+        if not api_ok:
             rate_limiter.acquire(platform)
             r = check_availability(
                 url         = w["restaurant_url"],
@@ -411,12 +453,48 @@ def _accelerate_venue(platform: str, venue_id, target_date: str,
         )
 
 
+# Range mode rotates which dates are sampled each cycle.
+# 80 dates × 10s = unbounded; instead, hit 5 dates per tick and rotate forward.
+RANGE_DATES_PER_TICK = 5
+_range_cursor: dict[str, int] = {}  # watch_id → index into _dates_for_watch list
+
+
+def _dates_to_check_this_tick(watch: dict) -> list[str]:
+    """
+    Return a small window of dates to check this tick, rotating across calls
+    so the whole range is covered over multiple ticks instead of all at once.
+
+    Always includes today + the next ``RANGE_DATES_PER_TICK - 1`` dates from
+    the rotation cursor — guarantees same-day cancellations are seen fast.
+    """
+    all_dates = _dates_for_watch(watch)
+    if len(all_dates) <= RANGE_DATES_PER_TICK:
+        return all_dates
+
+    wid = watch.get("id", "")
+    cursor = _range_cursor.get(wid, 0) % len(all_dates)
+
+    # Reserve slot 0 for the soonest date (most urgent / today)
+    window = [all_dates[0]]
+    cur = max(cursor, 1)
+    while len(window) < RANGE_DATES_PER_TICK and cur < len(all_dates):
+        window.append(all_dates[cur])
+        cur += 1
+
+    # Advance cursor; wrap once we exhaust the range
+    next_cursor = cur if cur < len(all_dates) else 1
+    _range_cursor[wid] = next_cursor
+    return window
+
+
 def _check_watch_date_range(watch: dict) -> dict:
     """
-    Check availability across all dates for range/any watches.
-    Collects slots per date, sends one combined alert per cooldown window.
+    Check availability across a sampled window of dates for range/any watches.
+    Rotates which dates are sampled across ticks so the entire range gets
+    coverage without freezing the scheduler.
+    Sends one combined alert per cooldown window.
     """
-    dates = _dates_for_watch(watch)
+    dates = _dates_to_check_this_tick(watch)
     dates_with_slots: dict[str, list] = {}
     success = True
 
@@ -464,13 +542,38 @@ def _check_watch_date_range(watch: dict) -> dict:
                     f"⚠️ Auto-booking crashed for <b>{_esc(watch.get('restaurant_name'))}</b>: {_esc(exc)}",
                 )
 
-        if not was_recently_alerted(watch_id):
+        # Dedup: if slot set unchanged since last alert, don't re-send
+        all_slots_flat = [s for sl in dates_with_slots.values() for s in sl]
+        new_sig  = _slot_signature(all_slots_flat)
+        prev_sig = get_previous_slot_signature(watch_id)
+        if new_sig == prev_sig:
+            logger.debug("Alert dedup: same slot signature as last alert for %s", watch_id)
+        elif not was_recently_alerted(watch_id):
             from notify import send_range_alert
             sent = send_range_alert(watch, dates_with_slots, tg_chat_id=chat_id)
             if sent:
-                log_alert(watch_id, f"Found slots on {len(dates_with_slots)} date(s)")
+                log_alert_with_signature(
+                    watch_id,
+                    f"Found slots on {len(dates_with_slots)} date(s)",
+                    all_slots_flat,
+                )
 
     return {"success": success, "slots": all_slots, "dates_with_slots": dates_with_slots}
+
+
+def _is_past_date_watch(watch: dict) -> bool:
+    """True if every date this watch covers is already in the past."""
+    today = _date.today()
+    mode = watch.get("date_mode", "single")
+    try:
+        if mode == "range":
+            end = _date.fromisoformat(watch.get("date_to") or watch["target_date"])
+            return end < today
+        if mode == "any":
+            return False
+        return _date.fromisoformat(watch["target_date"]) < today
+    except (ValueError, KeyError, TypeError):
+        return False
 
 
 def check_single_watch(watch: dict) -> dict:
@@ -501,17 +604,12 @@ def check_single_watch(watch: dict) -> dict:
                 burst=is_burst)
     _check_t0 = _time.perf_counter()
 
-    _resolve_venue_id(watch)
+    if _is_past_date_watch(watch):
+        logger.info("Auto-deactivating past-date watch %s (%s)", watch.get("id"), watch["target_date"])
+        deactivate_watch(watch.get("id", ""))
+        return {"success": True, "slots": [], "html_hash": ""}
 
-    # Skip single-date watches whose target has already passed
-    if watch.get("date_mode", "single") == "single":
-        try:
-            if _date.fromisoformat(watch["target_date"]) < _date.today():
-                logger.debug("Skipping past-date watch %s (%s)", watch.get("id"), watch["target_date"])
-                deactivate_watch(watch.get("id", ""))
-                return {"success": True, "slots": [], "html_hash": ""}
-        except (ValueError, KeyError):
-            pass
+    _resolve_venue_id(watch)
 
     if watch.get("date_mode", "single") != "single":
         out = _check_watch_date_range(watch)
@@ -560,11 +658,18 @@ def check_single_watch(watch: dict) -> dict:
                     f"⚠️ Auto-booking crashed for <b>{_esc(watch.get('restaurant_name'))}</b>: {_esc(exc)}",
                 )
 
-        if not was_recently_alerted(watch_id):
+        # Dedup against last-sent slot signature
+        new_sig  = _slot_signature(slots)
+        prev_sig = get_previous_slot_signature(watch_id)
+        if new_sig == prev_sig:
+            logger.debug("Alert dedup: same slots as last alert for %s", watch_id)
+        elif not was_recently_alerted(watch_id):
             from notify import send_alert
             sent = send_alert(watch, slots, tg_chat_id=chat_id)
             if sent:
-                log_alert(watch_id, f"Found {len(slots)} slots")
+                log_alert_with_signature(
+                    watch_id, f"Found {len(slots)} slots", slots,
+                )
 
     metrics.log("check_done",
                 watch_id=watch.get("id"),
@@ -579,17 +684,48 @@ def check_single_watch(watch: dict) -> dict:
 # Normal check — all watches
 # ══════════════════════════════════════════════════════════════════════
 
-SCHEDULER_TICK_SECONDS = 30  # how often check_all_watches fires; per-watch is_due() filters
+SCHEDULER_TICK_SECONDS = 30   # how often check_all_watches fires; per-watch is_due() filters
+WATCH_POOL_SIZE        = 8    # concurrent watch checks
+PER_WATCH_TIMEOUT_SECS = 120  # kill a watch's check if it exceeds this
+
+# Shared executor for both regular tick + burst (built lazily, reused across ticks).
+_watch_executor: Optional["_ThreadPoolExecutor"] = None  # type: ignore[name-defined]
+
+
+def _get_watch_executor():
+    """Lazy singleton ThreadPoolExecutor for parallel watch checks."""
+    global _watch_executor
+    if _watch_executor is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _watch_executor = ThreadPoolExecutor(
+            max_workers=WATCH_POOL_SIZE,
+            thread_name_prefix="watch",
+        )
+    return _watch_executor
+
+
+def _run_watch_safely(watch: dict) -> None:
+    """Wrap check_single_watch with mark_checked + hard timeout (worker-thread side)."""
+    import priority
+    try:
+        check_single_watch(watch)
+    except Exception as exc:
+        logger.exception("Error checking watch %s: %s", watch.get("id"), exc)
+    finally:
+        priority.mark_checked(watch["id"], priority.compute_interval_seconds(watch))
 
 
 def check_all_watches():
     """
     Adaptive tick. Iterates all active watches and only checks those whose
     per-watch interval (from ``priority.compute_interval_seconds``) has elapsed.
-    Burst-mode watches are skipped here — handled by ``_burst_check``.
-    Per-domain rate limiting is enforced inside ``_fetch_slots_for_date``.
+
+    Watches run in a shared thread pool — slow Playwright fetches no longer
+    block the scheduler. Each watch has a hard timeout; stuck checks are
+    logged and the slot stays open for next tick.
     """
     import priority
+    from concurrent.futures import wait, FIRST_EXCEPTION
 
     watches = get_watches(active_only=True)
     with _burst_lock:
@@ -601,13 +737,27 @@ def check_all_watches():
         len(due), len(watches), len(burst_snapshot),
     )
 
-    for watch in due:
-        try:
-            check_single_watch(watch)
-        except Exception as exc:
-            logger.exception("Error checking watch %s: %s", watch.get("id"), exc)
-        finally:
-            priority.mark_checked(watch["id"], priority.compute_interval_seconds(watch))
+    # Liveness ping always — empty ticks still prove the loop is alive
+    try:
+        from health import record_tick
+        record_tick()
+    except Exception:
+        pass
+
+    if not due:
+        return
+
+    executor = _get_watch_executor()
+    futures = {executor.submit(_run_watch_safely, w): w for w in due}
+
+    # Bounded wait — orphan stragglers (worker thread still runs, but tick returns).
+    done, not_done = wait(futures, timeout=PER_WATCH_TIMEOUT_SECS)
+    if not_done:
+        slow = [futures[f].get("restaurant_name", "?") for f in not_done]
+        logger.warning(
+            "Tick timeout after %ds — %d watch(es) still running: %s",
+            PER_WATCH_TIMEOUT_SECS, len(not_done), ", ".join(slow[:5]),
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -690,14 +840,15 @@ def _burst_check():
     watches      = get_watches(active_only=True)
     burst_watches = [w for w in watches if w["id"] in burst_snapshot]
 
-    if burst_watches:
-        logger.debug("Burst check: %d watch(es)", len(burst_watches))
+    if not burst_watches:
+        return
+    logger.debug("Burst check: %d watch(es)", len(burst_watches))
 
-    for watch in burst_watches:
-        try:
-            check_single_watch(watch)
-        except Exception as exc:
-            logger.exception("Burst check error for watch %s: %s", watch.get("id"), exc)
+    # Parallel fan-out via shared pool; bounded wait so the burst tick stays snappy.
+    from concurrent.futures import wait
+    executor = _get_watch_executor()
+    futures = [executor.submit(check_single_watch, w) for w in burst_watches]
+    wait(futures, timeout=PER_WATCH_TIMEOUT_SECS)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -750,6 +901,13 @@ def start_scheduler() -> BackgroundScheduler:
     if _scheduler is not None and _scheduler.running:
         logger.info("Scheduler already running.")
         return _scheduler
+
+    # Observability: Sentry + /healthz (no-op when env vars not set)
+    try:
+        from health import init_observability
+        init_observability()
+    except Exception as exc:
+        logger.warning("Observability init failed: %s", exc)
 
     _scheduler = BackgroundScheduler(daemon=True)
 
@@ -810,11 +968,19 @@ def start_scheduler() -> BackgroundScheduler:
 
 
 def stop_scheduler():
-    global _scheduler
+    global _scheduler, _watch_executor
     if _scheduler and _scheduler.running:
         _scheduler.shutdown(wait=False)
         logger.info("Scheduler stopped.")
         _scheduler = None
+    if _watch_executor is not None:
+        _watch_executor.shutdown(wait=False, cancel_futures=True)
+        _watch_executor = None
+    try:
+        from scraper import shutdown_browser
+        shutdown_browser()
+    except Exception:
+        pass
 
 
 def is_running() -> bool:

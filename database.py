@@ -348,6 +348,62 @@ def save_availability(watch_id: str, slots: list, html_hash: str = ""):
     })
 
 
+def _slot_signature(slots: list) -> str:
+    """Stable hash representing a slot set (order-independent)."""
+    import hashlib
+    items = sorted(
+        f"{s.get('time','')}|{s.get('extra','')[:30]}" for s in slots
+    )
+    return hashlib.sha1("\n".join(items).encode("utf-8")).hexdigest()[:16]
+
+
+def get_previous_slot_signature(watch_id: str) -> str:
+    """Return the slot signature from the most recent *prior* alert, or ''."""
+    db = get_db()
+    doc = db.alert_log.find_one(
+        {"watch_id": str(watch_id)},
+        sort=[("sent_at", -1)],
+    )
+    return doc.get("slot_sig", "") if doc else ""
+
+
+# ── Platform tokens (cached, survives restarts) ──────────────────────
+
+def save_platform_token(platform: str, token: str) -> None:
+    """Persist a platform auth token for reuse across restarts."""
+    db = get_db()
+    db.platform_tokens.update_one(
+        {"platform": platform},
+        {"$set": {
+            "platform": platform,
+            "token":    token,
+            "updated_at": datetime.now(timezone.utc),
+        }},
+        upsert=True,
+    )
+
+
+def load_platform_token(platform: str) -> Optional[str]:
+    """Return the stored token (or None) for the given platform."""
+    db = get_db()
+    doc = db.platform_tokens.find_one({"platform": platform})
+    return doc.get("token") if doc else None
+
+
+def log_alert_with_signature(watch_id: str, message: str, slots: list) -> str:
+    """Log an alert and attach slot signature for next-tick diff/dedup. Returns sig."""
+    sig = _slot_signature(slots)
+    db = get_db()
+    db.alert_log.insert_one({
+        "watch_id":   str(watch_id),
+        "message":    message,
+        "sent_at":    datetime.now(timezone.utc),
+        "slot_sig":   sig,
+        "slot_count": len(slots),
+    })
+    return sig
+
+
 def get_latest_availability(watch_id: str) -> Optional[dict]:
     db = get_db()
     doc = db.availability.find_one(
