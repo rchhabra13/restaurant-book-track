@@ -275,27 +275,22 @@ def _send_telegram(text: str, chat_id: str) -> bool:
     target = chat_id or TELEGRAM_CHAT_ID
     if not target:
         return False
-    try:
-        from metrics import log as _mlog
-        t0 = _time.perf_counter()
-        resp = _session.post(
-            TELEGRAM_SEND_URL.format(token=TELEGRAM_BOT_TOKEN),
-            json={"chat_id": target, "text": text,
-                  "parse_mode": "HTML", "disable_web_page_preview": True},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        _mlog("alert_sent", channel="telegram", chat_id=str(target),
-              duration_ms=round((_time.perf_counter() - t0) * 1000, 2))
-        return True
-    except Exception as exc:
-        logger.error("Telegram send failed → %s: %s", chat_id, exc)
+    from metrics import api_call
+    with api_call("telegram.send", chat_id=str(target), bytes=len(text)) as call:
         try:
-            from metrics import log as _mlog
-            _mlog("alert_failed", channel="telegram", chat_id=str(target), error=repr(exc))
-        except Exception:
-            pass
-        return False
+            resp = _session.post(
+                TELEGRAM_SEND_URL.format(token=TELEGRAM_BOT_TOKEN),
+                json={"chat_id": target, "text": text,
+                      "parse_mode": "HTML", "disable_web_page_preview": True},
+                timeout=10,
+            )
+            call["status"] = resp.status_code
+            resp.raise_for_status()
+            return True
+        except Exception as exc:
+            logger.error("Telegram send failed → %s: %s", chat_id, exc)
+            call["error_str"] = str(exc)[:120]
+            return False
 
 
 def _send_whatsapp(text: str, to: Optional[str] = None) -> bool:
@@ -312,28 +307,23 @@ def _send_whatsapp(text: str, to: Optional[str] = None) -> bool:
         logger.debug("No WhatsApp recipient configured.")
         return False
 
-    try:
-        from metrics import log as _mlog
-        t0 = _time.perf_counter()
-        resp = _session.post(
-            TWILIO_SEND_URL.format(sid=TWILIO_ACCOUNT_SID),
-            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-            data={"From": TWILIO_WA_FROM, "To": recipient, "Body": text},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        _mlog("alert_sent", channel="whatsapp", to=str(recipient),
-              duration_ms=round((_time.perf_counter() - t0) * 1000, 2))
-        logger.info("WhatsApp sent → %s", recipient)
-        return True
-    except Exception as exc:
-        logger.error("WhatsApp send failed → %s: %s", recipient, exc)
+    from metrics import api_call
+    with api_call("whatsapp.send", to=str(recipient), bytes=len(text)) as call:
         try:
-            from metrics import log as _mlog
-            _mlog("alert_failed", channel="whatsapp", to=str(recipient), error=repr(exc))
-        except Exception:
-            pass
-        return False
+            resp = _session.post(
+                TWILIO_SEND_URL.format(sid=TWILIO_ACCOUNT_SID),
+                auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+                data={"From": TWILIO_WA_FROM, "To": recipient, "Body": text},
+                timeout=10,
+            )
+            call["status"] = resp.status_code
+            resp.raise_for_status()
+            logger.info("WhatsApp sent → %s", recipient)
+            return True
+        except Exception as exc:
+            logger.error("WhatsApp send failed → %s: %s", recipient, exc)
+            call["error_str"] = str(exc)[:120]
+            return False
 
 
 # ══════════════════════════════════════════════════════════════════════

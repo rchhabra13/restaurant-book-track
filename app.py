@@ -8,7 +8,8 @@ from datetime import date, datetime, timezone, timedelta
 import logging
 import time as _time
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+from logging_config import configure as _configure_logging
+_configure_logging()
 
 from database import (
     add_restaurant,

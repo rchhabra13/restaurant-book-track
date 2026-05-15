@@ -1173,10 +1173,8 @@ async def post_init(application: Application):
 # ═══════════════════════════════════════════════════════════════════════
 
 def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    from logging_config import configure as _configure_logging
+    _configure_logging()
 
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN not set in .env — cannot start bot.")

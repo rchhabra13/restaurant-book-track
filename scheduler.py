@@ -382,6 +382,7 @@ def _fetch_slots_for_date(watch: dict, target_date: str) -> dict:
 
     def _do_fetch() -> dict:
         import rate_limiter
+        from metrics import log_fallback
         rate_limiter.acquire(platform)
         slots, api_ok = _get_slots_via_api(w)
         html_hash = ""
@@ -391,6 +392,12 @@ def _fetch_slots_for_date(watch: dict, target_date: str) -> dict:
         # failed (no token, network error, etc). An empty list from the
         # official API is authoritative — don't waste a browser load.
         if not api_ok:
+            log_fallback(
+                from_path=f"{platform}.api",
+                to_path="scraper",
+                reason="api_unavailable",
+                venue_id=venue_id, date=target_date, party=party,
+            )
             rate_limiter.acquire(platform)
             r = check_availability(
                 url         = w["restaurant_url"],
@@ -996,7 +1003,8 @@ def get_burst_watch_ids() -> Set[str]:
 
 if __name__ == "__main__":
     import time
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    from logging_config import configure as _configure_logging
+    _configure_logging()
     logger.info("Starting scheduler in standalone mode…")
     start_scheduler()
     try:

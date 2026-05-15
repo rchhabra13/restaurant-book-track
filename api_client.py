@@ -125,22 +125,29 @@ class ResyClient:
 
     def _login(self) -> bool:
         """Log in and store auth token for booking calls."""
-        try:
-            resp = self.session.post(
-                f"{RESY_BASE}/3/auth/password",
-                json={"email": self.email, "password": self.password},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            self.token = data.get("token") or data.get("auth_token")
-            if self.token:
-                self.session.headers["X-Resy-Auth-Token"] = self.token
-                logger.info("Resy: logged in as %s", self.email)
-                return True
-            logger.warning("Resy login: no token in response")
-        except Exception as exc:
-            logger.error("Resy login failed: %s", exc)
+        from metrics import api_call
+        with api_call("resy.login", email=self.email) as call:
+            try:
+                resp = self.session.post(
+                    f"{RESY_BASE}/3/auth/password",
+                    json={"email": self.email, "password": self.password},
+                    timeout=10,
+                )
+                call["status"] = resp.status_code
+                resp.raise_for_status()
+                data = resp.json()
+                self.token = data.get("token") or data.get("auth_token")
+                if self.token:
+                    self.session.headers["X-Resy-Auth-Token"] = self.token
+                    logger.info("Resy: logged in as %s", self.email)
+                    call["token_chars"] = len(self.token)
+                    return True
+                logger.warning("Resy login: no token in response")
+                call["token_chars"] = 0
+            except Exception as exc:
+                logger.error("Resy login failed: %s", exc)
+                call["error_str"] = str(exc)[:120]
+                # Don't re-raise — caller checks .token
         return False
 
     # ── Venue lookup ──────────────────────────────────────────────────
@@ -153,31 +160,36 @@ class ResyClient:
           https://resy.com/cities/ny/semma
           https://resy.com/cities/ny/semma?seats=2&date=2026-05-10
         """
+        from metrics import api_call
         city, slug = parse_resy_url(url)
         if not city or not slug:
             logger.warning("Resy: could not parse URL %s", url)
             return None
 
-        try:
-            resp = self.session.get(
-                f"{RESY_BASE}/3/venue/find",
-                params={"url_slug": slug, "location": city},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        with api_call("resy.get_venue_id", slug=slug, city=city) as call:
+            try:
+                resp = self.session.get(
+                    f"{RESY_BASE}/3/venue/find",
+                    params={"url_slug": slug, "location": city},
+                    timeout=10,
+                )
+                call["status"] = resp.status_code
+                resp.raise_for_status()
+                data = resp.json()
 
-            # Response shape: {"id": {"resy": 12345}, ...} or {"venue": {"id": ...}}
-            venue_id = (
-                data.get("id", {}).get("resy")
-                or data.get("venue", {}).get("id")
-                or data.get("id")
-            )
-            if venue_id:
-                logger.info("Resy: resolved %s → venue_id=%s", slug, venue_id)
-                return int(venue_id)
-        except Exception as exc:
-            logger.error("Resy venue lookup failed for %s: %s", url, exc)
+                venue_id = (
+                    data.get("id", {}).get("resy")
+                    or data.get("venue", {}).get("id")
+                    or data.get("id")
+                )
+                if venue_id:
+                    logger.info("Resy: resolved %s → venue_id=%s", slug, venue_id)
+                    call["venue_id"] = int(venue_id)
+                    return int(venue_id)
+                call["venue_id"] = None
+            except Exception as exc:
+                logger.error("Resy venue lookup failed for %s: %s", url, exc)
+                call["error_str"] = str(exc)[:120]
         return None
 
     # ── Availability ──────────────────────────────────────────────────
@@ -200,6 +212,7 @@ class ResyClient:
         Fetch available slots from the Resy /4/find endpoint.
         Returns a list of ApiSlot objects ready for display or booking.
         """
+        from metrics import api_call
         params = {
             "lat":        0,
             "long":       0,
@@ -208,49 +221,57 @@ class ResyClient:
             "venue_id":   venue_id,
         }
         data = None
-        for attempt in range(3):
-            try:
-                resp = self.session.get(f"{RESY_BASE}/4/find", params=params, timeout=10)
-                if resp.status_code in (429, 503):
-                    wait = 2 ** attempt
-                    logger.warning("Resy rate-limited (attempt %d) — waiting %ds", attempt + 1, wait)
-                    time.sleep(wait)
-                    continue
-                if self._refresh_token_if_needed(resp):
+        with api_call("resy.get_slots",
+                      venue_id=venue_id, date=date, party=party_size) as call:
+            for attempt in range(3):
+                try:
                     resp = self.session.get(f"{RESY_BASE}/4/find", params=params, timeout=10)
-                resp.raise_for_status()
-                data = resp.json()
-                break
-            except Exception as exc:
-                logger.error("Resy get_slots attempt %d failed: %s", attempt + 1, exc)
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
-        if data is None:
-            return []
+                    call["status"]   = resp.status_code
+                    call["attempts"] = attempt + 1
+                    if resp.status_code in (429, 503):
+                        wait = 2 ** attempt
+                        logger.warning("Resy rate-limited (attempt %d) — waiting %ds", attempt + 1, wait)
+                        time.sleep(wait)
+                        continue
+                    if self._refresh_token_if_needed(resp):
+                        resp = self.session.get(f"{RESY_BASE}/4/find", params=params, timeout=10)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    break
+                except Exception as exc:
+                    logger.error("Resy get_slots attempt %d failed: %s", attempt + 1, exc)
+                    call["error_str"] = str(exc)[:120]
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+            if data is None:
+                call["slots"] = 0
+                return []
 
-        slots: List[ApiSlot] = []
-        venues = data.get("results", {}).get("venues", [])
-        for v in venues:
-            for raw in v.get("slots", []):
-                start      = raw.get("date", {}).get("start", "")
-                time_str   = _parse_resy_time(start)
-                config     = raw.get("config", {})
-                config_id  = config.get("id")
-                config_tok = config.get("token")
-                extra      = config.get("type", "")   # e.g. "Dining Room"
+            slots: List[ApiSlot] = []
+            venues = data.get("results", {}).get("venues", [])
+            for v in venues:
+                for raw in v.get("slots", []):
+                    start      = raw.get("date", {}).get("start", "")
+                    time_str   = _parse_resy_time(start)
+                    config     = raw.get("config", {})
+                    config_id  = config.get("id")
+                    config_tok = config.get("token")
+                    extra      = config.get("type", "")   # e.g. "Dining Room"
 
-                if time_str:
-                    slots.append(ApiSlot(
-                        time_str    = time_str,
-                        party_size  = party_size,
-                        extra       = extra,
-                        config_id   = config_id,
-                        config_token= config_tok,
-                        platform    = "resy",
-                    ))
+                    if time_str:
+                        slots.append(ApiSlot(
+                            time_str    = time_str,
+                            party_size  = party_size,
+                            extra       = extra,
+                            config_id   = config_id,
+                            config_token= config_tok,
+                            platform    = "resy",
+                        ))
 
-        logger.info("Resy: found %d slot(s) for venue %s on %s", len(slots), venue_id, date)
-        return slots
+            call["slots"] = len(slots)
+            logger.info("Resy: found %d slot(s) for venue %s on %s",
+                        len(slots), venue_id, date)
+            return slots
 
     # ── Booking ───────────────────────────────────────────────────────
 
@@ -392,49 +413,59 @@ class OpenTableClient:
         """
         Fetch slots from OpenTable's availability widget API.
         """
-        try:
-            resp = self.session.get(
-                f"{OT_BASE}/dapi/fe/gql",
-                params={
-                    "query": "Availability",
-                    "variables": json.dumps({
-                        "restaurantId": restaurant_id,
-                        "date": date,
-                        "partySize": party_size,
-                        "isRequiredConsumerPage": False,
-                    }),
-                },
-                timeout=10,
-            )
-            resp.raise_for_status()
-        except Exception:
-            # Fall back to widget endpoint
-            return self._get_slots_widget(restaurant_id, date, party_size)
+        from metrics import api_call, log_fallback
+        with api_call("opentable.get_slots",
+                      restaurant_id=restaurant_id, date=date, party=party_size) as call:
+            try:
+                resp = self.session.get(
+                    f"{OT_BASE}/dapi/fe/gql",
+                    params={
+                        "query": "Availability",
+                        "variables": json.dumps({
+                            "restaurantId": restaurant_id,
+                            "date": date,
+                            "partySize": party_size,
+                            "isRequiredConsumerPage": False,
+                        }),
+                    },
+                    timeout=10,
+                )
+                call["status"] = resp.status_code
+                resp.raise_for_status()
+            except Exception as exc:
+                call["error_str"] = str(exc)[:120]
+                log_fallback("opentable.gql", "opentable.widget",
+                             reason="gql_failed", restaurant_id=restaurant_id)
+                return self._get_slots_widget(restaurant_id, date, party_size)
 
-        slots: List[ApiSlot] = []
-        try:
-            data = resp.json()
-            times = (
-                data.get("data", {})
-                    .get("availability", {})
-                    .get("times", [])
-            )
-            for t in times:
-                time_str  = t.get("timeOffsetISO8601") or t.get("time") or ""
-                slot_hash = t.get("slotHash") or t.get("hash") or ""
-                if time_str:
-                    slots.append(ApiSlot(
-                        time_str   = _parse_ot_time(time_str),
-                        party_size = party_size,
-                        slot_hash  = slot_hash,
-                        platform   = "opentable",
-                    ))
-        except Exception as exc:
-            logger.warning("OpenTable response parse error: %s", exc)
+            slots: List[ApiSlot] = []
+            try:
+                data = resp.json()
+                times = (
+                    data.get("data", {})
+                        .get("availability", {})
+                        .get("times", [])
+                )
+                for t in times:
+                    time_str  = t.get("timeOffsetISO8601") or t.get("time") or ""
+                    slot_hash = t.get("slotHash") or t.get("hash") or ""
+                    if time_str:
+                        slots.append(ApiSlot(
+                            time_str   = _parse_ot_time(time_str),
+                            party_size = party_size,
+                            slot_hash  = slot_hash,
+                            platform   = "opentable",
+                        ))
+            except Exception as exc:
+                logger.warning("OpenTable response parse error: %s", exc)
+                call["error_str"] = str(exc)[:120]
 
-        if not slots:
-            return self._get_slots_widget(restaurant_id, date, party_size)
-        return slots
+            if not slots:
+                log_fallback("opentable.gql", "opentable.widget",
+                             reason="gql_empty", restaurant_id=restaurant_id)
+                return self._get_slots_widget(restaurant_id, date, party_size)
+            call["slots"] = len(slots)
+            return slots
 
     def _get_slots_widget(
         self,

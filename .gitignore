@@ -19,6 +19,7 @@ playwright-report/
 
 # Logs / temp
 *.log
+logs/
 /tmp/
 
 # OS

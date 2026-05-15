@@ -99,16 +99,21 @@ _http_session = requests.Session()
 
 
 def _fetch_with_requests(url: str) -> Optional[str]:
+    from metrics import api_call
     headers = {"User-Agent": USER_AGENT}
-    try:
-        # Single attempt; let scheduler tick retry instead of blocking thread.
-        resp = _http_session.get(url, headers=headers,
-                                 timeout=(5, REQUEST_TIMEOUT))  # (connect, read)
-        resp.raise_for_status()
-        return resp.text
-    except requests.RequestException as exc:
-        logger.warning("HTTP fetch failed for %s: %s", url, exc)
-        return None
+    domain = urlparse(url).netloc
+    with api_call("scraper.requests", url=url, domain=domain) as call:
+        try:
+            resp = _http_session.get(url, headers=headers,
+                                     timeout=(5, REQUEST_TIMEOUT))
+            call["status"] = resp.status_code
+            call["bytes"]  = len(resp.content)
+            resp.raise_for_status()
+            return resp.text
+        except requests.RequestException as exc:
+            logger.warning("HTTP fetch failed for %s: %s", url, exc)
+            call["error_str"] = str(exc)[:120]
+            return None
 
 
 PLAYWRIGHT_NAV_TIMEOUT_MS  = 15_000  # max nav time per page
@@ -196,36 +201,42 @@ def _fetch_with_playwright(url: str) -> Optional[str]:
     A fresh BrowserContext is created per fetch so cookies/state don't leak
     across requests. No retries — scheduler will revisit on next tick.
     """
-    browser = _get_browser()
-    if browser is None:
-        return None
+    from metrics import api_call
+    domain = urlparse(url).netloc
+    with api_call("scraper.playwright", url=url, domain=domain) as call:
+        browser = _get_browser()
+        if browser is None:
+            call["error_str"] = "playwright_not_available"
+            return None
 
-    deadline = time.monotonic() + PLAYWRIGHT_TOTAL_BUDGET_S
-    context = None
-    try:
-        context = browser.new_context(user_agent=USER_AGENT)
-        page = context.new_page()
-        page.set_default_navigation_timeout(PLAYWRIGHT_NAV_TIMEOUT_MS)
-        page.set_default_timeout(PLAYWRIGHT_NAV_TIMEOUT_MS)
-        page.goto(url, wait_until="domcontentloaded",
-                  timeout=PLAYWRIGHT_NAV_TIMEOUT_MS)
-        remaining_ms = max(200, int((deadline - time.monotonic()) * 1000))
-        page.wait_for_timeout(min(PLAYWRIGHT_RENDER_WAIT_MS, remaining_ms))
-        return page.content()
-    except Exception as exc:
-        logger.warning("Playwright failed for %s: %s", url, exc)
-        # Mark this thread's browser as dead — get re-created on next call
+        deadline = time.monotonic() + PLAYWRIGHT_TOTAL_BUDGET_S
+        context = None
         try:
-            _pw_tls.browser = None
-        except Exception:
-            pass
-        return None
-    finally:
-        if context is not None:
+            context = browser.new_context(user_agent=USER_AGENT)
+            page = context.new_page()
+            page.set_default_navigation_timeout(PLAYWRIGHT_NAV_TIMEOUT_MS)
+            page.set_default_timeout(PLAYWRIGHT_NAV_TIMEOUT_MS)
+            page.goto(url, wait_until="domcontentloaded",
+                      timeout=PLAYWRIGHT_NAV_TIMEOUT_MS)
+            remaining_ms = max(200, int((deadline - time.monotonic()) * 1000))
+            page.wait_for_timeout(min(PLAYWRIGHT_RENDER_WAIT_MS, remaining_ms))
+            html = page.content()
+            call["bytes"] = len(html)
+            return html
+        except Exception as exc:
+            logger.warning("Playwright failed for %s: %s", url, exc)
+            call["error_str"] = str(exc)[:120]
             try:
-                context.close()
+                _pw_tls.browser = None
             except Exception:
                 pass
+            return None
+        finally:
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
 
 
 # ── HTML response cache (per-URL, short TTL) ─────────────────────────
