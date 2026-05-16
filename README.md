@@ -401,12 +401,63 @@ Events are retained 14 days then auto-pruned.
 
 ---
 
-## Known Limitations
+## Known Issues / Problems
 
-- Resy API returns 419 when login is rate-limited — 5-minute cooldown between retries is baked in
-- Playwright fallback is slow (~10s per check) — only used when API fails or for generic/Yelp sites
-- Release pattern learner needs at least 3 historical observations per restaurant to make predictions
-- MongoDB must be running before starting — no offline mode
+### 🛑 Resy API blocked by reCAPTCHA + IP fingerprinting
+
+**Status:** active blocker. Resy gates non-browser API access behind Google reCAPTCHA. Every `/4/find` call from a plain `requests.Session` returns `HTTP 419 Unauthorized` regardless of:
+- valid auth token from a logged-in session
+- IP rotation (tested via VPN — Toronto endpoint also blocked)
+- header spoofing (Origin, Referer, User-Agent)
+- cookie injection
+
+The hardcoded public API key (`VbWk7s3L4KiK5fzlO7JD3Q5EYolEVsC`) appears to be on Resy's per-key blocklist after years of bot abuse.
+
+**Current workaround:** Playwright headless Chromium fallback. Works (real browser passes detection) but slow — ~3 seconds per fetch even with persistent browser singleton. Tick latency for 6 watches: 34 seconds.
+
+**Real fix in progress:** see "Under Development" below.
+
+### ⚠️ Cold-start tick latency
+
+With 6 active watches and Playwright fallback active, the first scheduler tick takes ~34 seconds because:
+- 6 watches × 2 dates per range × ~3s Playwright fetch = 36s
+- Subsequent ticks are instant (priority intervals dedupe re-checks)
+
+Not a freeze — APScheduler handles it correctly with `max_instances=1 + coalesce=True`. Just slow first pass.
+
+### Other limitations
+
+- Release pattern learner needs at least 3 historical observations per restaurant before it makes predictions
+- MongoDB must be running before startup — no offline degradation mode
+- OpenTable `_login()` is a stub; API works for slot search but auto-book unimplemented
+- WhatsApp via Twilio sandbox is approval-free but caps at 1 number; production needs Meta Business verification (~1 week)
+
+---
+
+## Under Development
+
+### 🚧 Chrome browser extension (current focus)
+
+The most reliable path to bypass Resy's bot detection is to **run the API calls inside the user's own logged-in Chrome session**. The extension will:
+
+1. Run as a Manifest v3 background service worker in your browser
+2. Poll Resy's `/4/find` endpoint every 30s using your real cookies — Resy sees a real user, no 419 ever
+3. POST detected slots to a local `/ingest` endpoint on the scheduler
+4. The existing scheduler reuses its diff detection, alert pipeline, Telegram + WhatsApp, etc.
+
+**Result:** sub-30-second detection latency, no proxy cost, no token theft, no IP bans. As long as your Chrome is running, you bypass every layer of Resy's bot defence.
+
+Trade-off: requires browser to be open. Acceptable for desktop/laptop use.
+
+ETA: this commit + ~3 hours.
+
+### Backlog
+
+- Move from sandbox to production WhatsApp (Meta Business verification)
+- Stripe-gated paid tier (alerts-only SaaS — see internal STRATEGY.md)
+- Auto-book stripped from public repo (legal exposure — NYC anti-piracy law)
+- Replace Streamlit admin UI with FastAPI + HTMX for multi-tenancy
+- iCal feed export so users can subscribe in their calendar
 
 ---
 
