@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>TableWatch Bridge</title>
+  <style>
+    :root {
+      --bg: #1a1a1a; --fg: #f0f0f0; --muted: #999; --accent: #4ade80;
+      --accent-off: #555; --err: #f87171; --border: #333;
+    }
+    body {
+      width: 340px; margin: 0; padding: 14px;
+      background: var(--bg); color: var(--fg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+    }
+    h1 { font-size: 14px; margin: 0 0 10px; display: flex; align-items: center; gap: 6px; }
+    .dot {
+      width: 8px; height: 8px; border-radius: 50%; display: inline-block;
+      background: var(--accent-off);
+    }
+    .dot.on { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+    .row {
+      display: flex; justify-content: space-between; padding: 4px 0;
+      border-bottom: 1px solid var(--border); font-size: 12px;
+    }
+    .row .k { color: var(--muted); }
+    .row .v { font-family: ui-monospace, Menlo, monospace; }
+    .err { color: var(--err); font-size: 11px; margin-top: 6px; word-break: break-word; }
+    .btns { display: flex; gap: 6px; margin-top: 12px; }
+    button {
+      flex: 1; padding: 7px 8px; border: 1px solid var(--border);
+      background: #2a2a2a; color: var(--fg); border-radius: 5px;
+      font-size: 12px; cursor: pointer;
+    }
+    button:hover { background: #333; }
+    button.primary { background: var(--accent); color: #000; border-color: var(--accent); }
+    button.primary:hover { background: #5fe695; }
+    details { margin-top: 12px; font-size: 12px; }
+    summary { cursor: pointer; color: var(--muted); }
+    input, textarea {
+      width: 100%; box-sizing: border-box; margin-top: 4px;
+      padding: 5px; background: #111; color: var(--fg);
+      border: 1px solid var(--border); border-radius: 4px;
+      font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+    }
+    textarea { min-height: 70px; resize: vertical; }
+    label { display: block; margin-top: 8px; font-size: 11px; color: var(--muted); }
+    .small { font-size: 10px; color: var(--muted); margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <h1>
+    <span id="dot" class="dot"></span>
+    TableWatch Bridge
+  </h1>
+
+  <div class="row"><span class="k">Status</span><span class="v" id="status">…</span></div>
+  <div class="row"><span class="k">Watches</span><span class="v" id="watches">…</span></div>
+  <div class="row"><span class="k">Interval</span><span class="v" id="interval">…</span></div>
+  <div class="row"><span class="k">Last poll</span><span class="v" id="lastRun">never</span></div>
+
+  <div class="err" id="err"></div>
+
+  <div class="btns">
+    <button id="toggle"   class="primary">Start</button>
+    <button id="pollNow">Poll now</button>
+  </div>
+
+  <details>
+    <summary>Settings</summary>
+
+    <label for="ingestUrl">Ingest URL (local scheduler)</label>
+    <input id="ingestUrl" type="text" placeholder="http://127.0.0.1:8091/ingest" />
+
+    <label for="apiKey">Resy API key</label>
+    <input id="apiKey" type="text" placeholder="VbWk7s3L4KiK5fzlO7JD3Q5EYolEVsC" />
+
+    <label for="intervalSec">Poll interval (seconds, min 30)</label>
+    <input id="intervalSec" type="number" min="30" placeholder="30" />
+
+    <label for="watchesJson">Watches (JSON)</label>
+    <textarea id="watchesJson"
+      placeholder='[{"venue_id":5340,"slug":"carbone","party_size":2,"dates":["2026-06-15","2026-06-16"]}]'></textarea>
+    <div class="small">venue_id from <code>/3/venue/find</code> · dates are YYYY-MM-DD</div>
+
+    <div class="btns">
+      <button id="save" class="primary">Save</button>
+    </div>
+  </details>
+
+  <script src="popup.js"></script>
+</body>
+</html>

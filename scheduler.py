@@ -916,6 +916,13 @@ def start_scheduler() -> BackgroundScheduler:
     except Exception as exc:
         logger.warning("Observability init failed: %s", exc)
 
+    # Ingest server for the browser extension bridge
+    try:
+        from ingest import init_ingest_server
+        init_ingest_server()
+    except Exception as exc:
+        logger.warning("Ingest server init failed: %s", exc)
+
     _scheduler = BackgroundScheduler(daemon=True)
 
     # 1. Adaptive tick — fires often; priority.is_due() filters which watches actually run.

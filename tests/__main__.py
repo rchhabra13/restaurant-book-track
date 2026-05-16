@@ -13,6 +13,7 @@ UNIT_MODULES = [
     "tests.test_scheduler",
     "tests.test_health",
     "tests.test_logging",
+    "tests.test_ingest",
 ]
 
 

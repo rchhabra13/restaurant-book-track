@@ -29,3 +29,5 @@ Thumbs.db
 # Screenshots from booker (contain PII)
 *.png
 *.jpg
+# …but DO commit the extension's icon assets
+!extension/icons/*.png

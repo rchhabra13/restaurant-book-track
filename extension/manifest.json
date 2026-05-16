@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "TableWatch Bridge",
+  "version": "0.1.0",
+  "description": "Polls Resy/OpenTable from your logged-in browser session and forwards open slots to your local TableWatch scheduler.",
+
+  "permissions": ["storage", "alarms"],
+  "host_permissions": [
+    "https://api.resy.com/*",
+    "https://*.opentable.com/*",
+    "http://127.0.0.1:*/*",
+    "http://localhost:*/*"
+  ],
+
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "TableWatch Bridge",
+    "default_icon": {
+      "16":  "icons/icon16.png",
+      "48":  "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+
+  "icons": {
+    "16":  "icons/icon16.png",
+    "48":  "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
