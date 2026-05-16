@@ -9,13 +9,16 @@ Built this because Resy's own "Notify" feature is too slow — by the time you g
 ## What It Does
 
 - **Monitors** restaurant reservation pages on Resy, OpenTable, Yelp, or any URL
-- **Alerts instantly** via Telegram when a slot opens
+- **Alerts instantly** via Telegram (and WhatsApp via Twilio if configured)
+- **Conversational Telegram bot** — `add bungalow`, `watch carbone any 4`, `stop watching odo` — no slash commands required
+- **🆕 Chrome extension bridge** — bypasses Resy's reCAPTCHA / 419 by polling from your own logged-in session, see [`extension/`](./extension/)
 - **Burst mode** — detects upcoming release windows and switches to aggressive polling right before inventory drops
 - **Diff detection** — when slot count changes mid-day (cancellations), automatically accelerates polling for 5 minutes
 - **Adaptive intervals** — hot watches (≤3 days out) poll every 60s, cold ones every 15min
 - **Fan-out cache** — multiple watches on the same venue share one API call per cycle
 - **Rate limiting** — per-domain token bucket prevents IP bans
-- **Metrics** — every fetch, alert, burst trigger, and cache event logged with latency
+- **Metrics + structured logs** — every fetch, alert, burst trigger, and fallback recorded with latency in `logs/api.log`
+- **/healthz endpoint** — external monitors can detect a stuck scheduler
 - **Auto-cleanup** — past watches and stale alerts deleted nightly
 
 ---
@@ -434,28 +437,34 @@ Not a freeze — APScheduler handles it correctly with `max_instances=1 + coales
 
 ---
 
-## Under Development
+## 🚀 Chrome Extension — the Resy bypass
 
-### 🚧 Chrome browser extension (current focus)
+The most reliable path to defeat Resy's bot detection is **a small Chrome extension that polls from your own logged-in session**.
 
-The most reliable path to bypass Resy's bot detection is to **run the API calls inside the user's own logged-in Chrome session**. The extension will:
+Already built and shipped in this repo at [`extension/`](./extension/). See [`extension/README.md`](./extension/README.md) for full setup, but the short version:
 
-1. Run as a Manifest v3 background service worker in your browser
-2. Poll Resy's `/4/find` endpoint every 30s using your real cookies — Resy sees a real user, no 419 ever
-3. POST detected slots to a local `/ingest` endpoint on the scheduler
-4. The existing scheduler reuses its diff detection, alert pipeline, Telegram + WhatsApp, etc.
+1. Start the scheduler — it now also boots an ingest server at `http://127.0.0.1:8091/ingest`
+2. Chrome → `chrome://extensions` → enable **Developer mode** → **Load unpacked** → pick the `extension/` folder
+3. Sign in to https://resy.com in the same Chrome
+4. Click the extension icon → Settings → paste a watches JSON like:
+   ```json
+   [{"venue_id": 5340, "slug": "carbone", "party_size": 2,
+     "dates": ["2026-06-15", "2026-06-16"]}]
+   ```
+5. Hit **Start**. Every 30s the extension polls Resy with your real cookies and forwards slots to the scheduler. The existing diff / dedup / cooldown / Telegram / WhatsApp pipeline lights up exactly as before.
 
-**Result:** sub-30-second detection latency, no proxy cost, no token theft, no IP bans. As long as your Chrome is running, you bypass every layer of Resy's bot defence.
+**Why it works:** the request originates from your real browser tab — Resy sees a logged-in user, never triggers reCAPTCHA, never returns 419. No proxy fees, no token theft, no IP bans.
 
-Trade-off: requires browser to be open. Acceptable for desktop/laptop use.
+**Trade-off:** Chrome must stay open. Fine for laptop/desktop use.
 
-ETA: this commit + ~3 hours.
+---
 
-### Backlog
+## Roadmap
 
-- Move from sandbox to production WhatsApp (Meta Business verification)
-- Stripe-gated paid tier (alerts-only SaaS — see internal STRATEGY.md)
-- Auto-book stripped from public repo (legal exposure — NYC anti-piracy law)
+- Auto-detect `auth_token` cookie in extension and inject as `X-Resy-Auth-Token` (enables booking, not just monitoring)
+- OpenTable support inside the extension (different endpoint structure)
+- Pull watch list from MongoDB instead of pasting JSON into the popup
+- Move WhatsApp from Twilio sandbox to production (Meta Business verification, ~1 week)
 - Replace Streamlit admin UI with FastAPI + HTMX for multi-tenancy
 - iCal feed export so users can subscribe in their calendar
 
